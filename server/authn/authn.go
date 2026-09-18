@@ -31,9 +31,18 @@ import (
 
 // ErrUnauthenticated reports that a request carried no valid credentials. An
 // [Authenticator] returns it, or an error wrapping it, to make [Middleware]
-// answer 401 Unauthorized. Any other error is treated as an internal provider
-// failure and answered 500.
+// answer 401 Unauthorized. Any error that is neither this nor [ErrForbidden] is
+// treated as an internal provider failure and answered 500.
 var ErrUnauthenticated = errors.New("authn: unauthenticated")
+
+// ErrForbidden reports that a request carried valid credentials but the
+// authenticated principal is not permitted. An [Authenticator] returns it, or
+// an error wrapping it, to make [Middleware] answer 403 Forbidden. It is
+// distinct from [ErrUnauthenticated]: the caller proved who it is, and that
+// identity is the thing being refused, so folding it into a 401 would tell the
+// caller to present a different credential when the credential was never the
+// problem.
+var ErrForbidden = errors.New("authn: forbidden")
 
 // Caller is the authenticated principal resolved from a request.
 type Caller struct {
@@ -77,10 +86,11 @@ func CallerFromContext(ctx context.Context) (*Caller, bool) {
 }
 
 // Middleware returns HTTP middleware that authenticates every request
-// before passing it to the next handler, and answers 401 (or 500 on an internal
-// provider failure) when authentication fails. On success it stores the
-// resolved identity on the request context, where downstream handlers read it
-// with [CallerFromContext].
+// before passing it to the next handler, and answers 401 (403 when the
+// principal is authenticated but not permitted, or 500 on an internal provider
+// failure) when authentication fails. On success it stores the resolved
+// identity on the request context, where downstream handlers read it with
+// [CallerFromContext].
 //
 // A nil a yields pass-through middleware, so a caller can wire Middleware
 // unconditionally.
@@ -107,16 +117,24 @@ func Middleware(a Authenticator) func(http.Handler) http.Handler {
 	}
 }
 
-// writeAuthError answers a failed authentication. A credential problem is a
-// 401; anything else is an internal provider failure and a 500.
+// writeAuthError answers a failed authentication. An authenticated-but-refused
+// principal is a 403, a credential problem is a 401, and anything else is an
+// internal provider failure and a 500. [ErrForbidden] is checked first because
+// a forbidden error does not wrap [ErrUnauthenticated]; were the order flipped
+// the default 500 arm would swallow it.
 func writeAuthError(w http.ResponseWriter, err error) {
-	if !errors.Is(err, ErrUnauthenticated) {
+	switch {
+	case errors.Is(err, ErrForbidden):
+		// The credential verified; the identity it named is not permitted.
+		// The detail (which principal, that an allow-list exists) stays in the
+		// provider's own log rather than the response.
+		http.Error(w, "forbidden", http.StatusForbidden)
+	case errors.Is(err, ErrUnauthenticated):
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	default:
 		// A provider-internal failure (for example an unreachable token
 		// issuer), not a credential problem. Keep the detail out of the
 		// response; a provider is expected to log its own errors.
 		http.Error(w, "authentication failed", http.StatusInternalServerError)
-		return
 	}
-
-	http.Error(w, "unauthorized", http.StatusUnauthorized)
 }

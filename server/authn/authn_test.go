@@ -98,6 +98,28 @@ func TestMiddlewareInternalErrorIs500(t *testing.T) {
 	}
 }
 
+// TestMiddlewareForbiddenIs403 pins the third writeAuthError arm: an error
+// wrapping ErrForbidden is an authenticated-but-refused principal, answered 403
+// rather than the 401 a credential problem gets or the 500 an internal failure
+// gets. ErrForbidden does not wrap ErrUnauthenticated, so without its own arm it
+// would fall through to the 500 default.
+func TestMiddlewareForbiddenIs403(t *testing.T) {
+	auth := NewCustom(func(r *http.Request) (*Caller, error) {
+		return nil, fmt.Errorf("principal not permitted: %w", ErrForbidden)
+	})
+
+	h := Middleware(auth)(http.HandlerFunc(echoUserID))
+
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Authorization", "Bearer x")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+
+	if got, want := rr.Code, http.StatusForbidden; got != want {
+		t.Errorf("status = %d, want %d", got, want)
+	}
+}
+
 func TestMiddlewareNilIsPassThrough(t *testing.T) {
 	h := Middleware(nil)(http.HandlerFunc(echoUserID))
 	rr := httptest.NewRecorder()
