@@ -18,6 +18,7 @@ package pubsub
 import (
 	"flag"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -28,23 +29,59 @@ import (
 	"google.golang.org/adk/v2/cmd/launcher/web"
 	"google.golang.org/adk/v2/internal/cli/util"
 	"google.golang.org/adk/v2/server/adkrest/controllers/triggers"
+	"google.golang.org/adk/v2/server/authn"
 )
 
 type pubsubConfig struct {
-	pathPrefix        string
-	triggerMaxRetries int
-	triggerBaseDelay  time.Duration
-	triggerMaxDelay   time.Duration
-	triggerMaxRuns    int
+	pathPrefix                 string
+	triggerMaxRetries          int
+	triggerBaseDelay           time.Duration
+	triggerMaxDelay            time.Duration
+	triggerMaxRuns             int
+	triggerOIDCAudience        string
+	triggerOIDCServiceAccounts string
+}
+
+// Config configures the Pub/Sub sublauncher beyond its command-line flags.
+type Config struct {
+	// Authenticator, when non-nil, gates the Pub/Sub trigger endpoint and takes
+	// precedence over the -trigger_oidc_* flags. Supply it to verify inbound
+	// deliveries with a scheme of your own instead of the built-in Google OIDC
+	// one.
+	//
+	// It is deliberately separate from launcher.Config.Authenticator, which
+	// gates the REST API. A trigger endpoint receives Pub/Sub push and Eventarc
+	// deliveries, not the browser and API-key traffic the REST authenticator is
+	// chosen for, so reusing that one here would gate deliveries with the wrong
+	// credential scheme. The two are configured independently on purpose.
+	Authenticator authn.Authenticator
 }
 
 type pubsubLauncher struct {
 	flags  *flag.FlagSet
 	config *pubsubConfig
+
+	// authOverride is an Authenticator supplied through NewLauncherWithConfig.
+	// When non-nil it wins over the -trigger_oidc_* flags. Nil otherwise.
+	authOverride authn.Authenticator
+
+	// authenticator is the resolved gate for the trigger endpoint, set by
+	// [pubsubLauncher.Parse]: authOverride when non-nil, otherwise one built
+	// from the flags, otherwise nil for an open endpoint. Both SetupSubrouters
+	// and UserMessage read this one field, so the protection the endpoint
+	// enforces and the message describing it cannot drift apart.
+	authenticator authn.Authenticator
 }
 
 // NewLauncher creates a new pubsub launcher. It extends Web launcher.
 func NewLauncher() web.Sublauncher {
+	return NewLauncherWithConfig(Config{})
+}
+
+// NewLauncherWithConfig creates a pubsub launcher with programmatic
+// configuration. A non-nil cfg.Authenticator gates the trigger endpoint and
+// takes precedence over the -trigger_oidc_* flags.
+func NewLauncherWithConfig(cfg Config) web.Sublauncher {
 	config := &pubsubConfig{}
 
 	fs := flag.NewFlagSet("pubsub", flag.ContinueOnError)
@@ -53,10 +90,13 @@ func NewLauncher() web.Sublauncher {
 	fs.DurationVar(&config.triggerBaseDelay, "trigger_base_delay", 1*time.Second, "Base delay for trigger retry exponential backoff")
 	fs.DurationVar(&config.triggerMaxDelay, "trigger_max_delay", 10*time.Second, "Maximum delay for trigger retry exponential backoff")
 	fs.IntVar(&config.triggerMaxRuns, "trigger_max_concurrent_runs", 100, "Maximum concurrent trigger runs")
+	fs.StringVar(&config.triggerOIDCAudience, "trigger_oidc_audience", "", "If set, require a Google-signed OIDC token whose audience matches this value on the trigger endpoint. Enabling verification also requires -trigger_oidc_service_accounts.")
+	fs.StringVar(&config.triggerOIDCServiceAccounts, "trigger_oidc_service_accounts", "", "Comma-separated service account emails permitted to call the trigger endpoint; required whenever -trigger_oidc_audience is set. A token minted for manual testing must be requested with includeEmail:true so it carries the email this checks against.")
 
 	return &pubsubLauncher{
-		config: config,
-		flags:  fs,
+		config:       config,
+		flags:        fs,
+		authOverride: cfg.Authenticator,
 	}
 }
 
@@ -90,7 +130,65 @@ func (p *pubsubLauncher) Parse(args []string) ([]string, error) {
 	}
 	p.config.pathPrefix = strings.TrimSuffix(prefix, "/")
 
+	// Resolve the endpoint's gate now, while an error can still stop startup
+	// rather than surface as a crash-looping revision, and store it once so
+	// SetupSubrouters and UserMessage read the same decision.
+	auth, err := p.resolveAuthenticator()
+	if err != nil {
+		return nil, err
+	}
+	p.authenticator = auth
+
 	return p.flags.Args(), nil
+}
+
+// resolveAuthenticator decides how the trigger endpoint is gated: the
+// programmatic override first, the -trigger_oidc_* flags second. It is the one
+// place either input is read, so the gate SetupSubrouters wires and the status
+// UserMessage prints cannot describe different protection than is enforced.
+//
+// Audience alone is refused. A verified audience proves only that some
+// Google-signed token for that string was presented, not which principal sent
+// it, because the audience is chosen by whoever mints the token. Requiring the
+// allow-list keeps a caller from minting a token for the audience with a
+// service account of its own and being accepted.
+func (p *pubsubLauncher) resolveAuthenticator() (authn.Authenticator, error) {
+	audience := strings.TrimSpace(p.config.triggerOIDCAudience)
+	accounts := splitServiceAccounts(p.config.triggerOIDCServiceAccounts)
+
+	if p.authOverride != nil {
+		if audience != "" || len(accounts) > 0 {
+			log.Print("adk: pubsub: an Authenticator was supplied programmatically, so the " +
+				"-trigger_oidc_* flags are ignored.")
+		}
+		return p.authOverride, nil
+	}
+
+	switch {
+	case audience == "" && len(accounts) == 0:
+		// A trigger with no service account attaches no token, so an open
+		// endpoint is the correct default for that deployment.
+		return nil, nil
+	case audience == "":
+		return nil, fmt.Errorf("-trigger_oidc_service_accounts requires -trigger_oidc_audience")
+	case len(accounts) == 0:
+		return nil, fmt.Errorf("-trigger_oidc_audience requires -trigger_oidc_service_accounts")
+	}
+	return authn.NewGoogleOIDC(audience, accounts)
+}
+
+// splitServiceAccounts turns the comma-separated
+// -trigger_oidc_service_accounts value into a list, dropping empty entries so a
+// trailing comma or stray space cannot become an unmatchable "" in the
+// allow-list.
+func splitServiceAccounts(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // CommandLineSyntax returns the command-line syntax for the pubsub launcher.
@@ -130,11 +228,26 @@ func (p *pubsubLauncher) SetupSubrouters(router *mux.Router, config *launcher.Co
 		subrouter = router.PathPrefix(p.config.pathPrefix).Subrouter()
 	}
 
-	subrouter.HandleFunc("/apps/{app_name}/trigger/pubsub", controller.PubSubTriggerHandler).Methods(http.MethodPost)
+	// Gate only the trigger route. The subrouter can be the shared parent
+	// router when no path prefix is set, so wrapping the single handler rather
+	// than calling subrouter.Use keeps the middleware off every other
+	// sublauncher's routes. A nil authenticator wraps to a pass-through.
+	var handler http.Handler = http.HandlerFunc(controller.PubSubTriggerHandler)
+	if p.authenticator != nil {
+		handler = authn.Middleware(p.authenticator)(handler)
+	}
+	subrouter.Handle("/apps/{app_name}/trigger/pubsub", handler).Methods(http.MethodPost)
 	return nil
 }
 
 // UserMessage implements web.Sublauncher.
 func (p *pubsubLauncher) UserMessage(webURL string, printer func(v ...any)) {
 	printer(fmt.Sprintf("       pubsub:  PubSub trigger endpoint is available at %s%s/apps/{app_name}/trigger/pubsub", webURL, p.config.pathPrefix))
+	// Read the same field the route is gated with, so an operator is never told
+	// the endpoint is protected when it is not, nor the reverse.
+	if p.authenticator != nil {
+		printer("       pubsub:  OIDC verification is enabled on the PubSub trigger endpoint.")
+	} else {
+		printer("       pubsub:  OIDC verification is DISABLED; the PubSub trigger endpoint accepts unauthenticated requests.")
+	}
 }

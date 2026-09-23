@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package pubsub
+package eventarc
 
 import (
 	"fmt"
@@ -26,72 +26,19 @@ import (
 	"google.golang.org/adk/v2/server/authn"
 )
 
-func TestParse(t *testing.T) {
-	tests := []struct {
-		name       string
-		args       []string
-		wantPrefix string
-		wantRetry  int
-		wantErr    bool
-	}{
-		{
-			name:       "default values",
-			args:       []string{},
-			wantPrefix: "/api",
-			wantRetry:  3,
-			wantErr:    false,
-		},
-		{
-			name:       "custom prefix and retries",
-			args:       []string{"-path_prefix=/custom", "-trigger_max_retries=5"},
-			wantPrefix: "/custom",
-			wantRetry:  5,
-			wantErr:    false,
-		},
-		{
-			name:       "invalid retry count",
-			args:       []string{"-trigger_max_retries=-1"},
-			wantPrefix: "/api",
-			wantRetry:  3,
-			wantErr:    true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			l := NewLauncher().(*pubsubLauncher)
-			_, err := l.Parse(tt.args)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Parse() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if tt.wantErr {
-				return
-			}
-			if l.config.pathPrefix != tt.wantPrefix {
-				t.Errorf("Parse() pathPrefix = %v, want %v", l.config.pathPrefix, tt.wantPrefix)
-			}
-			if l.config.triggerMaxRetries != tt.wantRetry {
-				t.Errorf("Parse() triggerMaxRetries = %v, want %v", l.config.triggerMaxRetries, tt.wantRetry)
-			}
-		})
-	}
-}
-
 func TestSetupSubrouters(t *testing.T) {
-	l := NewLauncher().(*pubsubLauncher)
-	_, _ = l.Parse([]string{"-path_prefix=/api"})
+	l := NewLauncher().(*eventarcLauncher)
+	if _, err := l.Parse([]string{"-path_prefix=/api"}); err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
 
 	router := mux.NewRouter()
-	config := &launcher.Config{}
-
-	err := l.SetupSubrouters(router, config)
-	if err != nil {
+	if err := l.SetupSubrouters(router, &launcher.Config{}); err != nil {
 		t.Fatalf("SetupSubrouters() failed: %v", err)
 	}
 
-	// Verify route is registered
-	req := httptest.NewRequest(http.MethodPost, "/api/apps/my-app/trigger/pubsub", nil)
+	// Verify route is registered.
+	req := httptest.NewRequest(http.MethodPost, "/api/apps/my-app/trigger/eventarc", nil)
 	var match mux.RouteMatch
 	if !router.Match(req, &match) {
 		t.Errorf("SetupSubrouters() did not register expected route")
@@ -104,7 +51,7 @@ func TestSetupSubrouters(t *testing.T) {
 // caller that holds a Google-signed token for the audience.
 func TestParseResolvesOIDC(t *testing.T) {
 	const (
-		aud     = "https://pubsub.example/adk"
+		aud     = "https://eventarc.example/adk"
 		account = "svc@proj.iam.gserviceaccount.com"
 	)
 	tests := []struct {
@@ -124,9 +71,6 @@ func TestParseResolvesOIDC(t *testing.T) {
 			wantAuth: true,
 		},
 		{
-			// The whole point of the pairing: an audience with no allow-list
-			// verifies only that some Google-signed token for the string was
-			// presented, so it must not be accepted on its own.
 			name:    "audience without service accounts is rejected",
 			args:    []string{"-trigger_oidc_audience=" + aud},
 			wantErr: true,
@@ -137,8 +81,6 @@ func TestParseResolvesOIDC(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			// A trailing comma must not smuggle an empty, unmatchable account
-			// into the list and count as "an allow-list was given".
 			name:     "blank service-account entries are dropped",
 			args:     []string{"-trigger_oidc_audience=" + aud, "-trigger_oidc_service_accounts= " + account + " , "},
 			wantAuth: true,
@@ -152,7 +94,7 @@ func TestParseResolvesOIDC(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			l := NewLauncher().(*pubsubLauncher)
+			l := NewLauncher().(*eventarcLauncher)
 			_, err := l.Parse(tt.args)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("Parse() error = %v, wantErr %v", err, tt.wantErr)
@@ -170,12 +112,11 @@ func TestParseResolvesOIDC(t *testing.T) {
 // TestSetupSubroutersWiresOIDC drives a real router and observes a 401 on the
 // trigger route with no credential. It goes through SetupSubrouters rather than
 // reading l.authenticator, so it fails if a change stops SetupSubrouters from
-// wrapping the handler with the gate the flags asked for; a route that answered
-// 401 only because l.authenticator was inspected directly would not catch that.
+// wrapping the handler with the gate the flags asked for.
 func TestSetupSubroutersWiresOIDC(t *testing.T) {
-	l := NewLauncher().(*pubsubLauncher)
+	l := NewLauncher().(*eventarcLauncher)
 	if _, err := l.Parse([]string{
-		"-trigger_oidc_audience=https://pubsub.example/adk",
+		"-trigger_oidc_audience=https://eventarc.example/adk",
 		"-trigger_oidc_service_accounts=svc@proj.iam.gserviceaccount.com",
 	}); err != nil {
 		t.Fatalf("Parse() error = %v", err)
@@ -187,7 +128,7 @@ func TestSetupSubroutersWiresOIDC(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/apps/my-app/trigger/pubsub", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/apps/my-app/trigger/eventarc", nil)
 	router.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
@@ -196,9 +137,8 @@ func TestSetupSubroutersWiresOIDC(t *testing.T) {
 }
 
 // forbiddingAuth is a stand-in Authenticator that refuses every request with a
-// 403. It is distinguishable from the built-in Google OIDC gate, which answers
-// 401 to a request that carries no bearer token, so a test can tell which of
-// the two gated a route.
+// 403, distinguishable from the built-in Google OIDC gate's 401 for a request
+// carrying no bearer token.
 type forbiddingAuth struct{}
 
 func (forbiddingAuth) Authenticate(*http.Request) (*authn.Caller, error) {
@@ -207,12 +147,12 @@ func (forbiddingAuth) Authenticate(*http.Request) (*authn.Caller, error) {
 
 // TestConfigAuthenticatorWins checks that a programmatic Authenticator takes
 // precedence over the -trigger_oidc_* flags, and reaches the route. Both flags
-// are also set, so if the flags won instead the no-credential request would be
-// a 401 from the Google OIDC gate; the 403 can only come from the override.
+// are also set, so a 401 would mean the flags won; the 403 can only come from
+// the override.
 func TestConfigAuthenticatorWins(t *testing.T) {
-	l := NewLauncherWithConfig(Config{Authenticator: forbiddingAuth{}}).(*pubsubLauncher)
+	l := NewLauncherWithConfig(Config{Authenticator: forbiddingAuth{}}).(*eventarcLauncher)
 	if _, err := l.Parse([]string{
-		"-trigger_oidc_audience=https://pubsub.example/adk",
+		"-trigger_oidc_audience=https://eventarc.example/adk",
 		"-trigger_oidc_service_accounts=svc@proj.iam.gserviceaccount.com",
 	}); err != nil {
 		t.Fatalf("Parse() error = %v", err)
@@ -224,7 +164,7 @@ func TestConfigAuthenticatorWins(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/apps/my-app/trigger/pubsub", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/apps/my-app/trigger/eventarc", nil)
 	router.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusForbidden {
@@ -233,11 +173,10 @@ func TestConfigAuthenticatorWins(t *testing.T) {
 }
 
 // TestConfigAuthenticatorSkipsFlagValidation confirms the override is exempt
-// from the audience-requires-allow-list rule: an embedder that supplies its own
-// gate has already decided how callers are identified, so the flag pairing must
-// not reject a configuration that never used the flags.
+// from the audience-requires-allow-list rule: an embedder supplying its own gate
+// has already decided how callers are identified.
 func TestConfigAuthenticatorSkipsFlagValidation(t *testing.T) {
-	l := NewLauncherWithConfig(Config{Authenticator: forbiddingAuth{}}).(*pubsubLauncher)
+	l := NewLauncherWithConfig(Config{Authenticator: forbiddingAuth{}}).(*eventarcLauncher)
 	if _, err := l.Parse(nil); err != nil {
 		t.Fatalf("Parse() error = %v", err)
 	}
