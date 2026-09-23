@@ -16,6 +16,7 @@
 package cloudrun
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -41,6 +42,13 @@ type triggerConfigFlags struct {
 	baseDelay  time.Duration
 	maxDelay   time.Duration
 	maxRuns    int
+	// oidcAudience and oidcServiceAccounts, when set, are forwarded to the
+	// container as the sublauncher's -trigger_oidc_* flags. They are paired:
+	// computeFlags rejects one without the other, so an endpoint cannot deploy
+	// verifying an audience with no allow-list, nor an allow-list with no
+	// audience.
+	oidcAudience        string
+	oidcServiceAccounts string
 }
 
 type cloudRunServiceFlags struct {
@@ -117,11 +125,15 @@ func init() {
 	cloudrunCmd.PersistentFlags().DurationVar(&flags.cloudRun.pubsubTrigger.baseDelay, "pubsub_base_delay", 1*time.Second, "Base delay for PubSub trigger retry exponential backoff")
 	cloudrunCmd.PersistentFlags().DurationVar(&flags.cloudRun.pubsubTrigger.maxDelay, "pubsub_max_delay", 10*time.Second, "Maximum delay for PubSub trigger retry exponential backoff")
 	cloudrunCmd.PersistentFlags().IntVar(&flags.cloudRun.pubsubTrigger.maxRuns, "pubsub_max_concurrent_runs", 100, "Maximum concurrent PubSub trigger runs")
+	cloudrunCmd.PersistentFlags().StringVar(&flags.cloudRun.pubsubTrigger.oidcAudience, "pubsub_oidc_audience", "", "If set, require a Google-signed OIDC token with this audience on the PubSub trigger endpoint. Requires --pubsub_oidc_service_accounts.")
+	cloudrunCmd.PersistentFlags().StringVar(&flags.cloudRun.pubsubTrigger.oidcServiceAccounts, "pubsub_oidc_service_accounts", "", "Comma-separated service account emails permitted to call the PubSub trigger endpoint; required with --pubsub_oidc_audience. A token minted for manual testing needs includeEmail:true so it carries the email checked here.")
 	cloudrunCmd.PersistentFlags().BoolVar(&flags.cloudRun.eventarc, "eventarc", false, "Enable Eventarc subrouter")
 	cloudrunCmd.PersistentFlags().IntVar(&flags.cloudRun.eventarcTrigger.maxRetries, "eventarc_max_retries", 3, "Maximum retries for HTTP 429 errors from Eventarc triggers")
 	cloudrunCmd.PersistentFlags().DurationVar(&flags.cloudRun.eventarcTrigger.baseDelay, "eventarc_base_delay", 1*time.Second, "Base delay for Eventarc trigger retry exponential backoff")
 	cloudrunCmd.PersistentFlags().DurationVar(&flags.cloudRun.eventarcTrigger.maxDelay, "eventarc_max_delay", 10*time.Second, "Maximum delay for Eventarc trigger retry exponential backoff")
 	cloudrunCmd.PersistentFlags().IntVar(&flags.cloudRun.eventarcTrigger.maxRuns, "eventarc_max_concurrent_runs", 100, "Maximum concurrent Eventarc trigger runs")
+	cloudrunCmd.PersistentFlags().StringVar(&flags.cloudRun.eventarcTrigger.oidcAudience, "eventarc_oidc_audience", "", "If set, require a Google-signed OIDC token with this audience on the Eventarc trigger endpoint. Requires --eventarc_oidc_service_accounts.")
+	cloudrunCmd.PersistentFlags().StringVar(&flags.cloudRun.eventarcTrigger.oidcServiceAccounts, "eventarc_oidc_service_accounts", "", "Comma-separated service account emails permitted to call the Eventarc trigger endpoint; required with --eventarc_oidc_audience. A token minted for manual testing needs includeEmail:true so it carries the email checked here.")
 }
 
 // computeFlags uses command line arguments to create a full config
@@ -137,6 +149,19 @@ func (f *deployCloudRunFlags) computeFlags() error {
 			// the flag can be flipped later, and a value that can never be
 			// emitted safely is worth reporting either way.
 			if err := util.ValidateDockerfileSafe(f.cloudRun.a2aAgentCardURL, "--a2a_agent_url"); err != nil {
+				return err
+			}
+
+			// Both checks run before the temp dir is created, for the same
+			// reason as the --a2a_agent_url check: they can fail, and a
+			// rejection before any filesystem work leaves nothing behind. They
+			// run whether or not the trigger is enabled, since the enable flag
+			// can be flipped later and a value that can never be forwarded
+			// safely is worth reporting either way.
+			if err := validateTriggerOIDC(f.cloudRun.pubsubTrigger, "pubsub"); err != nil {
+				return err
+			}
+			if err := validateTriggerOIDC(f.cloudRun.eventarcTrigger, "eventarc"); err != nil {
 				return err
 			}
 
@@ -263,21 +288,91 @@ CMD ["/app/` + f.build.execFile + `", "web", "-port", "` + strconv.Itoa(f.cloudR
 			}
 			if f.cloudRun.pubsub {
 				b.WriteString(`, "pubsub"`)
-				fmt.Fprintf(&b, `, "--trigger_max_retries", "%d"`, f.cloudRun.pubsubTrigger.maxRetries)
-				fmt.Fprintf(&b, `, "--trigger_base_delay", "%s"`, f.cloudRun.pubsubTrigger.baseDelay.String())
-				fmt.Fprintf(&b, `, "--trigger_max_delay", "%s"`, f.cloudRun.pubsubTrigger.maxDelay.String())
-				fmt.Fprintf(&b, `, "--trigger_max_concurrent_runs", "%d"`, f.cloudRun.pubsubTrigger.maxRuns)
+				writeTriggerArgs(&b, f.cloudRun.pubsubTrigger)
 			}
 			if f.cloudRun.eventarc {
 				b.WriteString(`, "eventarc"`)
-				fmt.Fprintf(&b, `, "--trigger_max_retries", "%d"`, f.cloudRun.eventarcTrigger.maxRetries)
-				fmt.Fprintf(&b, `, "--trigger_base_delay", "%s"`, f.cloudRun.eventarcTrigger.baseDelay.String())
-				fmt.Fprintf(&b, `, "--trigger_max_delay", "%s"`, f.cloudRun.eventarcTrigger.maxDelay.String())
-				fmt.Fprintf(&b, `, "--trigger_max_concurrent_runs", "%d"`, f.cloudRun.eventarcTrigger.maxRuns)
+				writeTriggerArgs(&b, f.cloudRun.eventarcTrigger)
 			}
 			b.WriteString(`]`)
 			return os.WriteFile(f.build.dockerfileBuildPath, []byte(b.String()), 0o600)
 		})
+}
+
+// writeTriggerArgs appends one trigger's sublauncher flags to the CMD array
+// being built in b. Every call site passes its own trigger's config; passing
+// the other trigger's would deploy an endpoint with the wrong settings,
+// including the wrong OIDC audience, so prepareDockerfile is tested over the
+// whole emitted array rather than this helper in isolation.
+func writeTriggerArgs(b *strings.Builder, cfg triggerConfigFlags) {
+	fmt.Fprintf(b, `, "--trigger_max_retries", "%d"`, cfg.maxRetries)
+	fmt.Fprintf(b, `, "--trigger_base_delay", "%s"`, cfg.baseDelay.String())
+	fmt.Fprintf(b, `, "--trigger_max_delay", "%s"`, cfg.maxDelay.String())
+	fmt.Fprintf(b, `, "--trigger_max_concurrent_runs", "%d"`, cfg.maxRuns)
+	// These two are operator-supplied strings landing inside a JSON array, so
+	// they are JSON-encoded rather than pasted between literal quotes. Both go
+	// through jsonString: leaving either raw would let a value carrying a quote
+	// close its string and add arguments of its own. computeFlags has already
+	// screened them with ValidateDockerfileSafe, so this is the second layer.
+	// The emit guard is the trimmed value, matching validateTriggerOIDC and the
+	// sublauncher, so a whitespace-only value is treated as absent here too.
+	if strings.TrimSpace(cfg.oidcAudience) != "" {
+		fmt.Fprintf(b, `, "--trigger_oidc_audience", %s`, jsonString(cfg.oidcAudience))
+	}
+	if strings.TrimSpace(cfg.oidcServiceAccounts) != "" {
+		fmt.Fprintf(b, `, "--trigger_oidc_service_accounts", %s`, jsonString(cfg.oidcServiceAccounts))
+	}
+}
+
+// jsonString renders v as a JSON string literal for embedding in the CMD array.
+// Marshaling a string cannot return an error, so the fallback exists only to
+// keep the output well-formed, not because it is expected to run.
+//
+// json.Marshal does not reject invalid UTF-8; it rewrites each bad byte to
+// U+FFFD, which would deploy a value the operator never typed. That case does
+// not reach here: computeFlags screens both values with ValidateDockerfileSafe,
+// which rejects invalid UTF-8 (and quotes, backticks and backslashes) before a
+// Dockerfile is ever written.
+func jsonString(v string) string {
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return `""`
+	}
+	return string(encoded)
+}
+
+// validateTriggerOIDC rejects a half-configured OIDC pairing for one trigger and
+// screens the two operator-supplied values for characters that cannot be
+// embedded in the Dockerfile CMD safely.
+//
+// The pairing is mandatory in both directions. An audience with no allow-list
+// verifies only that some Google-signed token for that string was presented,
+// not which principal sent it, because the audience is chosen by whoever mints
+// the token; an allow-list with no audience verifies nothing at all. Catching
+// either here turns a misconfiguration into a local deploy error rather than a
+// container that crash-loops on startup or, worse, serves unverified.
+//
+// The trimmed values decide "present", matching the sublauncher, so a
+// whitespace-only value counts as absent rather than as a token the container
+// would trim away and then reject.
+func validateTriggerOIDC(cfg triggerConfigFlags, prefix string) error {
+	audience := strings.TrimSpace(cfg.oidcAudience)
+	accounts := strings.TrimSpace(cfg.oidcServiceAccounts)
+
+	switch {
+	case audience == "" && accounts == "":
+		// OIDC not configured for this trigger; nothing to forward.
+		return nil
+	case audience == "":
+		return fmt.Errorf("--%s_oidc_service_accounts requires --%s_oidc_audience", prefix, prefix)
+	case accounts == "":
+		return fmt.Errorf("--%s_oidc_audience requires --%s_oidc_service_accounts", prefix, prefix)
+	}
+
+	if err := util.ValidateDockerfileSafe(cfg.oidcAudience, fmt.Sprintf("--%s_oidc_audience", prefix)); err != nil {
+		return err
+	}
+	return util.ValidateDockerfileSafe(cfg.oidcServiceAccounts, fmt.Sprintf("--%s_oidc_service_accounts", prefix))
 }
 
 // gcloudDeployToCloudRun invokes gcloud to deploy source on CloudRun
